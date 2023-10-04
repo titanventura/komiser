@@ -9,15 +9,15 @@ import (
 
 	"github.com/tailwarden/komiser/providers"
 	"github.com/tailwarden/komiser/providers/linode/compute"
+	"github.com/tailwarden/komiser/providers/linode/lkepool"
 	"github.com/tailwarden/komiser/providers/linode/networking"
 	"github.com/tailwarden/komiser/providers/linode/postgres"
 	"github.com/tailwarden/komiser/providers/linode/sql"
 	"github.com/tailwarden/komiser/providers/linode/storage"
-	"github.com/tailwarden/komiser/providers/linode/lkepool"
 	"github.com/uptrace/bun"
 )
 
-func listOfSupportedServices() []providers.FetchDataFunction {
+func ListOfSupportedServices() []providers.FetchDataFunction {
 	return []providers.FetchDataFunction{
 		compute.LinodeInstancesAndInstanceDisks,
 		compute.LKEClusters,
@@ -33,7 +33,7 @@ func listOfSupportedServices() []providers.FetchDataFunction {
 }
 
 func FetchResources(ctx context.Context, client providers.ProviderClient, db *bun.DB, telemetry bool, analytics utils.Analytics) {
-	for _, fetchResources := range listOfSupportedServices() {
+	for _, fetchResources := range ListOfSupportedServices() {
 		resources, err := fetchResources(ctx, client)
 		if err != nil {
 			log.Printf("[%s][Linode] %s", client.Name, err)

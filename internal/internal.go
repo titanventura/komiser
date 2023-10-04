@@ -11,12 +11,14 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/getsentry/sentry-go"
 	"github.com/gin-gonic/gin"
 	"github.com/go-co-op/gocron"
 	"github.com/hashicorp/go-version"
+	"github.com/sirupsen/logrus"
 	log "github.com/sirupsen/logrus"
 	"github.com/slack-go/slack"
 	"github.com/uptrace/bun/dialect"
@@ -36,7 +38,7 @@ import (
 	do "github.com/tailwarden/komiser/providers/digitalocean"
 	"github.com/tailwarden/komiser/providers/gcp"
 	k8s "github.com/tailwarden/komiser/providers/k8s"
-	linode "github.com/tailwarden/komiser/providers/linode"
+	"github.com/tailwarden/komiser/providers/linode"
 	"github.com/tailwarden/komiser/providers/mongodbatlas"
 	"github.com/tailwarden/komiser/providers/oci"
 	scaleway "github.com/tailwarden/komiser/providers/scaleway"
@@ -257,32 +259,137 @@ func triggerFetchingWorfklow(ctx context.Context, client providers.ProviderClien
 	}
 }
 
+type Fetcher struct {
+	client providers.ProviderClient
+	fn     providers.FetchDataFunction
+}
+
+// Pipeline channel that takes list of Fetchers as input and returns channel of Fetcher as output
+func fetcherChan(fetchers []Fetcher) <-chan Fetcher {
+	out := make(chan Fetcher)
+	go func() {
+		for _, fetcher := range fetchers {
+			out <- fetcher
+		}
+		close(out)
+	}()
+	return out
+}
+
+// Pipeline based worker that performs the actual resource fetching, takes in FetcherChan and outputs a Resource channel
+func fetchWorker(fChan <-chan Fetcher) <-chan models.Resource {
+	out := make(chan models.Resource)
+	go func() {
+		for fetcher := range fChan {
+			resources, _ := fetcher.fn(context.Background(), fetcher.client)
+			for _, resource := range resources {
+				out <- resource
+			}
+		}
+		close(out)
+	}()
+	return out
+}
+
+// Utility method to fanIn the fanOut channels
+func fanIn(cs ...<-chan models.Resource) <-chan models.Resource {
+	var wg sync.WaitGroup
+	out := make(chan models.Resource, 64)
+
+	output := func(c <-chan models.Resource) {
+		for n := range c {
+			out <- n
+		}
+		wg.Done()
+	}
+	wg.Add(len(cs))
+	for _, c := range cs {
+		go output(c)
+	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
+}
+
 func fetchResources(ctx context.Context, clients []providers.ProviderClient, regions []string, telemetry bool) error {
+	fetchers := make([]Fetcher, 0)
+
 	for _, client := range clients {
-		if client.AWSClient != nil {
-			go triggerFetchingWorfklow(ctx, client, "AWS", telemetry, regions)
-		} else if client.DigitalOceanClient != nil {
-			go triggerFetchingWorfklow(ctx, client, "DigitalOcean", telemetry, regions)
-		} else if client.OciClient != nil {
-			go triggerFetchingWorfklow(ctx, client, "OCI", telemetry, regions)
-		} else if client.CivoClient != nil {
-			go triggerFetchingWorfklow(ctx, client, "Civo", telemetry, regions)
-		} else if client.K8sClient != nil {
-			go triggerFetchingWorfklow(ctx, client, "Kubernetes", telemetry, regions)
-		} else if client.LinodeClient != nil {
-			go triggerFetchingWorfklow(ctx, client, "Linode", telemetry, regions)
-		} else if client.TencentClient != nil {
-			go triggerFetchingWorfklow(ctx, client, "Tencent", telemetry, regions)
-		} else if client.AzureClient != nil {
-			go triggerFetchingWorfklow(ctx, client, "Azure", telemetry, regions)
-		} else if client.ScalewayClient != nil {
-			go triggerFetchingWorfklow(ctx, client, "Scaleway", telemetry, regions)
-		} else if client.MongoDBAtlasClient != nil {
-			go triggerFetchingWorfklow(ctx, client, "MongoDBAtlas", telemetry, regions)
-		} else if client.GCPClient != nil {
-			go triggerFetchingWorfklow(ctx, client, "GCP", telemetry, regions)
+		// if client.AWSClient != nil {
+		// 	go triggerFetchingWorfklow(ctx, client, "AWS", telemetry, regions)
+		// } else if client.DigitalOceanClient != nil {
+		// 	go triggerFetchingWorfklow(ctx, client, "DigitalOcean", telemetry, regions)
+		// } else if client.OciClient != nil {
+		// 	go triggerFetchingWorfklow(ctx, client, "OCI", telemetry, regions)
+		// } else if client.CivoClient != nil {
+		// 	go triggerFetchingWorfklow(ctx, client, "Civo", telemetry, regions)
+		// } else if client.K8sClient != nil {
+		// 	go triggerFetchingWorfklow(ctx, client, "Kubernetes", telemetry, regions)
+		// } else if client.LinodeClient != nil {
+		// 	go triggerFetchingWorfklow(ctx, client, "Linode", telemetry, regions)
+		// } else if client.TencentClient != nil {
+		// 	go triggerFetchingWorfklow(ctx, client, "Tencent", telemetry, regions)
+		// } else if client.AzureClient != nil {
+		// 	go triggerFetchingWorfklow(ctx, client, "Azure", telemetry, regions)
+		// } else if client.ScalewayClient != nil {
+		// 	go triggerFetchingWorfklow(ctx, client, "Scaleway", telemetry, regions)
+		// } else if client.MongoDBAtlasClient != nil {
+		// 	go triggerFetchingWorfklow(ctx, client, "MongoDBAtlas", telemetry, regions)
+		// } else if client.GCPClient != nil {
+		// 	go triggerFetchingWorfklow(ctx, client, "GCP", telemetry, regions)
+		// }
+
+		// Get List of Fetchers
+		if client.LinodeClient != nil {
+			for _, fetchDataFn := range linode.ListOfSupportedServices() {
+				fetchers = append(fetchers, Fetcher{
+					fn:     fetchDataFn,
+					client: client,
+				})
+			}
 		}
 	}
+
+	// Construct fetcher channel
+	fChan := fetcherChan(fetchers)
+
+	// Spawn Workers - FanOut pattern
+	workerChans := make([]<-chan models.Resource, 0)
+	numWorkers := 8 // to control number of concurrent goroutines
+	for i := 0; i < numWorkers; i++ {
+		workerChans = append(workerChans, fetchWorker(fChan))
+	}
+
+	// FanIn pattern
+	resourceChan := fanIn(workerChans...)
+
+	// Map to track number of resources
+	providerResourceCount := make(map[string]int)
+
+	// Listen to resourceChan and write to DB
+	for resource := range resourceChan {
+		_, err := db.NewInsert().Model(&resource).On("CONFLICT (resource_id) DO UPDATE").Set("cost = EXCLUDED.cost").Exec(context.Background())
+		if err != nil {
+			logrus.WithError(err).Errorf("db trigger failed")
+		}
+
+		if telemetry {
+			providerResourceCount[resource.Provider] += 1
+		}
+	}
+
+	if telemetry {
+		for provider, resCount := range providerResourceCount {
+			analytics.TrackEvent("discovered_resources", map[string]interface{}{
+				"provider":  provider,
+				"resources": resCount,
+			})
+		}
+	}
+
 	return nil
 }
 
