@@ -32,17 +32,7 @@ import (
 	"github.com/tailwarden/komiser/internal/config"
 	"github.com/tailwarden/komiser/models"
 	"github.com/tailwarden/komiser/providers"
-	"github.com/tailwarden/komiser/providers/aws"
-	azure "github.com/tailwarden/komiser/providers/azure"
-	"github.com/tailwarden/komiser/providers/civo"
-	do "github.com/tailwarden/komiser/providers/digitalocean"
-	"github.com/tailwarden/komiser/providers/gcp"
-	k8s "github.com/tailwarden/komiser/providers/k8s"
 	"github.com/tailwarden/komiser/providers/linode"
-	"github.com/tailwarden/komiser/providers/mongodbatlas"
-	"github.com/tailwarden/komiser/providers/oci"
-	scaleway "github.com/tailwarden/komiser/providers/scaleway"
-	"github.com/tailwarden/komiser/providers/tencent"
 	"github.com/tailwarden/komiser/utils"
 	"github.com/uptrace/bun"
 )
@@ -211,175 +201,79 @@ func setupDBConnection(c *models.Config) error {
 	return nil
 }
 
-func triggerFetchingWorfklow(ctx context.Context, client providers.ProviderClient, provider string, telemetry bool, regions []string) {
+func fetchResources(ctx context.Context, clients []providers.ProviderClient, regions []string, telemetry bool) error {
 	localHub := sentry.CurrentHub().Clone()
 
-	defer func() {
-		err := recover()
-		if err != nil {
-			log.WithField("err", err).Error(fmt.Sprintf("error fetching %s resources", provider))
-			localHub.CaptureException(err.(error))
-			localHub.Flush(2 * time.Second)
-		}
-	}()
+	providerResourceCount := make(map[string]int)
+	resCountMu := &sync.Mutex{}
 
-	localHub.ConfigureScope(func(scope *sentry.Scope) {
-		scope.SetTag("provider", provider)
-	})
-
-	if telemetry {
-		analytics.TrackEvent("fetching_resources", map[string]interface{}{
-			"provider": provider,
-		})
-	}
-
-	switch provider {
-	case "AWS":
-		aws.FetchResources(ctx, client, regions, db, telemetry, analytics)
-	case "DigitalOcean":
-		do.FetchResources(ctx, client, db, telemetry, analytics)
-	case "OCI":
-		oci.FetchResources(ctx, client, db, telemetry, analytics)
-	case "Civo":
-		civo.FetchResources(ctx, client, db, telemetry, analytics)
-	case "Kubernetes":
-		k8s.FetchResources(ctx, client, db, telemetry, analytics)
-	case "Linode":
-		linode.FetchResources(ctx, client, db, telemetry, analytics)
-	case "Tencent":
-		tencent.FetchResources(ctx, client, db, telemetry, analytics)
-	case "Azure":
-		azure.FetchResources(ctx, client, db, telemetry, analytics)
-	case "Scaleway":
-		scaleway.FetchResources(ctx, client, db, telemetry, analytics)
-	case "MongoDBAtlas":
-		mongodbatlas.FetchResources(ctx, client, db, telemetry, analytics)
-	case "GCP":
-		gcp.FetchResources(ctx, client, db, telemetry, analytics)
-	}
-}
-
-type Fetcher struct {
-	client providers.ProviderClient
-	fn     providers.FetchDataFunction
-}
-
-// Pipeline channel that takes list of Fetchers as input and returns channel of Fetcher as output
-func fetcherChan(fetchers []Fetcher) <-chan Fetcher {
-	out := make(chan Fetcher)
-	go func() {
-		for _, fetcher := range fetchers {
-			out <- fetcher
-		}
-		close(out)
-	}()
-	return out
-}
-
-// Pipeline based worker that performs the actual resource fetching, takes in FetcherChan and outputs a Resource channel
-func fetchWorker(fChan <-chan Fetcher) <-chan models.Resource {
-	out := make(chan models.Resource)
-	go func() {
-		for fetcher := range fChan {
-			resources, _ := fetcher.fn(context.Background(), fetcher.client)
-			for _, resource := range resources {
-				out <- resource
-			}
-		}
-		close(out)
-	}()
-	return out
-}
-
-// Utility method to fanIn the fanOut channels
-func fanIn(cs ...<-chan models.Resource) <-chan models.Resource {
-	var wg sync.WaitGroup
-	out := make(chan models.Resource, 64)
-
-	output := func(c <-chan models.Resource) {
-		for n := range c {
-			out <- n
-		}
-		wg.Done()
-	}
-	wg.Add(len(cs))
-	for _, c := range cs {
-		go output(c)
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-	return out
-}
-
-func fetchResources(ctx context.Context, clients []providers.ProviderClient, regions []string, telemetry bool) error {
-	fetchers := make([]Fetcher, 0)
+	wp := providers.NewWorkerPool(64)
+	wp.Start()
 
 	for _, client := range clients {
-		// if client.AWSClient != nil {
-		// 	go triggerFetchingWorfklow(ctx, client, "AWS", telemetry, regions)
-		// } else if client.DigitalOceanClient != nil {
-		// 	go triggerFetchingWorfklow(ctx, client, "DigitalOcean", telemetry, regions)
-		// } else if client.OciClient != nil {
-		// 	go triggerFetchingWorfklow(ctx, client, "OCI", telemetry, regions)
-		// } else if client.CivoClient != nil {
-		// 	go triggerFetchingWorfklow(ctx, client, "Civo", telemetry, regions)
-		// } else if client.K8sClient != nil {
-		// 	go triggerFetchingWorfklow(ctx, client, "Kubernetes", telemetry, regions)
-		// } else if client.LinodeClient != nil {
-		// 	go triggerFetchingWorfklow(ctx, client, "Linode", telemetry, regions)
-		// } else if client.TencentClient != nil {
-		// 	go triggerFetchingWorfklow(ctx, client, "Tencent", telemetry, regions)
-		// } else if client.AzureClient != nil {
-		// 	go triggerFetchingWorfklow(ctx, client, "Azure", telemetry, regions)
-		// } else if client.ScalewayClient != nil {
-		// 	go triggerFetchingWorfklow(ctx, client, "Scaleway", telemetry, regions)
-		// } else if client.MongoDBAtlasClient != nil {
-		// 	go triggerFetchingWorfklow(ctx, client, "MongoDBAtlas", telemetry, regions)
-		// } else if client.GCPClient != nil {
-		// 	go triggerFetchingWorfklow(ctx, client, "GCP", telemetry, regions)
-		// }
+		var providerName string
+		var listOfSupportedServices func() []providers.FetchDataFunction
 
-		// Get List of Fetchers
-		if client.LinodeClient != nil {
-			for _, fetchDataFn := range linode.ListOfSupportedServices() {
-				fetchers = append(fetchers, Fetcher{
-					fn:     fetchDataFn,
-					client: client,
-				})
-			}
+		if client.AWSClient != nil {
+			providerName = "AWS"
+		} else if client.DigitalOceanClient != nil {
+			providerName = "DigitalOcean"
+		} else if client.OciClient != nil {
+			providerName = "OCI"
+		} else if client.CivoClient != nil {
+			providerName = "Civo"
+		} else if client.K8sClient != nil {
+			providerName = "Kubernetes"
+		} else if client.LinodeClient != nil {
+			listOfSupportedServices = linode.ListOfSupportedServices
+			providerName = "Linode"
+		} else if client.TencentClient != nil {
+			providerName = "Tencent"
+		} else if client.AzureClient != nil {
+			providerName = "Azure"
+		} else if client.ScalewayClient != nil {
+			providerName = "Scaleway"
+		} else if client.MongoDBAtlasClient != nil {
+			providerName = "MongoDBAtlas"
+		} else if client.GCPClient != nil {
+			providerName = "GCP"
 		}
-	}
 
-	// Construct fetcher channel
-	fChan := fetcherChan(fetchers)
-
-	// Spawn Workers - FanOut pattern
-	workerChans := make([]<-chan models.Resource, 0)
-	numWorkers := 8 // to control number of concurrent goroutines
-	for i := 0; i < numWorkers; i++ {
-		workerChans = append(workerChans, fetchWorker(fChan))
-	}
-
-	// FanIn pattern
-	resourceChan := fanIn(workerChans...)
-
-	// Map to track number of resources
-	providerResourceCount := make(map[string]int)
-
-	// Listen to resourceChan and write to DB
-	for resource := range resourceChan {
-		_, err := db.NewInsert().Model(&resource).On("CONFLICT (resource_id) DO UPDATE").Set("cost = EXCLUDED.cost").Exec(context.Background())
-		if err != nil {
-			logrus.WithError(err).Errorf("db trigger failed")
-		}
+		localHub.ConfigureScope(func(scope *sentry.Scope) {
+			scope.SetTag("provider", providerName)
+		})
 
 		if telemetry {
-			providerResourceCount[resource.Provider] += 1
+			analytics.TrackEvent("fetching_resources", map[string]interface{}{
+				"provider": providerName,
+			})
+		}
+
+		for _, fetchDataFn := range listOfSupportedServices() {
+			wp.SubmitTask(func() {
+				resources, err := fetchDataFn(ctx, client)
+				if err != nil {
+					log.Printf("[%s][%s] %s", client.Name, providerName, err)
+					localHub.CaptureException(err)
+					localHub.Flush(2 * time.Second)
+				} else {
+					for _, resource := range resources {
+						_, err := db.NewInsert().Model(&resource).On("CONFLICT (resource_id) DO UPDATE").Set("cost = EXCLUDED.cost").Exec(context.Background())
+						if err != nil {
+							logrus.WithError(err).Errorf("db trigger failed")
+						}
+					}
+					if telemetry {
+						resCountMu.Lock()
+						providerResourceCount[providerName] += len(resources)
+						resCountMu.Unlock()
+					}
+				}
+			})
 		}
 	}
+
+	wp.Wait()
 
 	if telemetry {
 		for provider, resCount := range providerResourceCount {
@@ -529,7 +423,6 @@ func hitSlackWebhook(viewName string, port int, viewId int, resources int, cost 
 	if err != nil {
 		log.Warn(err)
 	}
-
 }
 
 func checkingAlerts(ctx context.Context, cfg models.Config, telemetry bool, port int, alerts []models.Alert) {
